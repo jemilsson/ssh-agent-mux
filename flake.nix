@@ -29,10 +29,10 @@
             # The Encode impl only handles SkEd25519 SK trailer (flags + counter)
             # separately from the signature data, but SkEcdsaSha2NistP256 falls
             # through to the generic path which wraps everything in one string,
-            # corrupting the signature. This one-line patch adds SkEcdsaSha2NistP256
-            # to the same branch as SkEd25519.
+            # corrupting the signature.
             postConfigure = ''
-              substituteInPlace cargo-vendor-dir/ssh-key-0.6.7/src/signature.rs \
+              chmod -R +w /build/cargo-vendor-dir/ssh-key-0.6.7/
+              substituteInPlace /build/cargo-vendor-dir/ssh-key-0.6.7/src/signature.rs \
                 --replace-fail \
                   'if self.algorithm == Algorithm::SkEd25519 {' \
                   'if self.algorithm == Algorithm::SkEd25519 || self.algorithm == Algorithm::SkEcdsaSha2NistP256 {'
