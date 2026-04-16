@@ -99,16 +99,46 @@ impl Session for MuxSession {
             })?)),
             "session-bind@openssh.com" => {
                 log::debug!("Forwarding session-bind to all upstream agents");
+
+                // Forward session-bind to all upstream agents in parallel.
+                let mut tasks: JoinSet<(
+                    PathBuf,
+                    Box<dyn Session>,
+                    Result<Option<Extension>, AgentError>,
+                )> = JoinSet::new();
+
+                for sock_path in self.socket_paths.clone() {
+                    let mut client = match self.upstream.remove(&sock_path) {
+                        Some(c) => c,
+                        None => match Self::connect(&sock_path).await {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        },
+                    };
+                    let req = request.clone();
+                    tasks.spawn(async move {
+                        let result =
+                            match timeout(SESSION_BIND_TIMEOUT, client.extension(req)).await {
+                                Ok(r) => r,
+                                Err(_) => Err(AgentError::Other("timeout".into())),
+                            };
+                        (sock_path, client, result)
+                    });
+                }
+
                 let mut any_succeeded = false;
-                let paths: Vec<_> = self.socket_paths.clone();
-                for sock_path in paths {
-                    if let Err(_) = self.ensure_connected(&sock_path).await {
-                        continue;
-                    }
-                    let client = self.upstream.get_mut(&sock_path).unwrap();
-                    match timeout(SESSION_BIND_TIMEOUT, client.extension(request.clone())).await {
-                        Ok(Ok(v)) => {
+                while let Some(join_result) = tasks.join_next().await {
+                    let (sock_path, client, result) = match join_result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log::error!("Session-bind task panicked: {}", e);
+                            continue;
+                        }
+                    };
+                    match result {
+                        Ok(v) => {
                             any_succeeded = true;
+                            self.upstream.insert(sock_path.clone(), client);
                             if v.is_some() {
                                 log::warn!(
                                     "session-bind succeeded on <{}> but returned unexpected data",
@@ -116,29 +146,24 @@ impl Session for MuxSession {
                                 );
                             }
                         }
-                        Ok(Err(AgentError::Failure)) => {
+                        Err(AgentError::Failure) => {
                             log::debug!(
                                 "Upstream <{}> does not support session-bind",
                                 sock_path.display()
                             );
+                            self.upstream.insert(sock_path, client);
                         }
-                        Ok(Err(e)) => {
+                        Err(e) => {
                             log::warn!(
                                 "Error forwarding session-bind to <{}>: {}",
                                 sock_path.display(),
                                 e
                             );
-                            self.upstream.remove(&sock_path);
-                        }
-                        Err(_) => {
-                            log::warn!(
-                                "Timeout forwarding session-bind to <{}>",
-                                sock_path.display()
-                            );
-                            self.upstream.remove(&sock_path);
+                            // Don't re-insert broken connection
                         }
                     }
                 }
+
                 if any_succeeded {
                     Ok(None)
                 } else {
