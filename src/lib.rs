@@ -1,21 +1,28 @@
 use std::{
     collections::HashMap,
-    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use ssh_agent_lib::{
     agent::{self, Agent, ListeningSocket, Session},
-    client,
+    client::Client,
     error::AgentError,
     proto::{extension::QueryResponse, Extension, Identity, SignRequest},
     ssh_key::{public::KeyData as PubKeyData, Signature},
 };
 use tokio::{
     net::UnixListener,
+    net::UnixStream,
     sync::{Mutex, OwnedMutexGuard},
+    time::timeout,
 };
+
+const SIGN_TIMEOUT: Duration = Duration::from_secs(60);
+const SESSION_BIND_TIMEOUT: Duration = Duration::from_secs(30);
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 type KnownPubKeysMap = HashMap<PubKeyData, PathBuf>;
 type KnownPubKeys = Arc<Mutex<KnownPubKeysMap>>;
@@ -41,8 +48,17 @@ impl Session for MuxAgent {
                 agent_sock_path.display()
             );
 
-            let mut client = self.connect_upstream_agent(agent_sock_path)?;
-            client.sign(request).await
+            let mut client = self.connect_upstream_agent(&agent_sock_path).await?;
+            match timeout(SIGN_TIMEOUT, client.sign(request)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    log::error!(
+                        "Timeout waiting for signature from upstream agent <{}>",
+                        agent_sock_path.display()
+                    );
+                    Err(AgentError::Failure)
+                }
+            }
         } else {
             log::error!("No upstream agent found for public key {}", &fingerprint);
             log::trace!("Known keys:\n{:#?}", self.known_keys);
@@ -56,38 +72,16 @@ impl Session for MuxAgent {
         log::trace!("incoming: extension({})", request.name);
         match request.name.as_str() {
             "query" => Ok(Some(Extension::new_message(QueryResponse {
-                extensions: ["session-bind@openssh.com"].map(String::from).to_vec(),
+                extensions: vec![],
             })?)),
+            // session-bind@openssh.com is per-connection state in upstream agents,
+            // but the mux creates a new connection for each operation. The binding
+            // would be lost before the subsequent sign request. Returning Failure
+            // makes OpenSSH fall back to regular "publickey" auth instead of
+            // "publickey-hostbound-v00@openssh.com", which works correctly.
             "session-bind@openssh.com" => {
-                let mut session_bind_suceeded = false;
-                for sock_path in &self.socket_paths {
-                    // Try extension on upstream agents; discard any upstream failures from agents
-                    // that don't support the extension (but the default is Failure if there are no
-                    // successful upstream responses)
-                    if let Ok(mut client) = self.connect_upstream_agent(sock_path) {
-                        match client.extension(request.clone()).await {
-                            // Any agent succeeding is an overall success
-                            Ok(v) => {
-                                session_bind_suceeded = true;
-                                if v.is_some() {
-                                    log::warn!("session-bind@openssh.com request succeeded on socket <{}>, but an invalid response was received", sock_path.display());
-                                }
-                            }
-                            // Don't propagate upstream lack of extension support
-                            Err(AgentError::Failure) => continue,
-                            // Report but ignore any unexpected errors
-                            Err(e) => {
-                                log::error!("Unexpected error on socket <{}> when requesting session-bind@openssh.com extension: {}", sock_path.display(), e);
-                                continue;
-                            }
-                        }
-                    }
-                }
-                if session_bind_suceeded {
-                    Ok(None)
-                } else {
-                    Err(AgentError::Failure)
-                }
+                log::debug!("Declining session-bind (not supported by multiplexer)");
+                Err(AgentError::Failure)
             }
             _ => Err(AgentError::Failure),
         }
@@ -140,27 +134,25 @@ impl MuxAgent {
         agent::listen(listen_sock, this).await
     }
 
-    fn connect_upstream_agent(
+    async fn connect_upstream_agent(
         &self,
         sock_path: impl AsRef<Path>,
     ) -> Result<Box<dyn Session>, AgentError> {
         let sock_path = sock_path.as_ref();
-        let stream = UnixStream::connect(sock_path)?;
-        let client = client::connect(stream.into()).map_err(|e| {
-            AgentError::Other(
-                format!(
-                    "Failed to connect to agent at {}: {}",
-                    sock_path.display(),
-                    e
-                )
-                .into(),
-            )
-        })?;
+        let stream = match timeout(CONNECT_TIMEOUT, UnixStream::connect(sock_path)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(AgentError::IO(e)),
+            Err(_) => {
+                return Err(AgentError::Other(
+                    format!("Timeout connecting to agent at {}", sock_path.display()).into(),
+                ))
+            }
+        };
         log::trace!(
             "Connected to upstream agent on socket: {}",
             sock_path.display()
         );
-        Ok(client)
+        Ok(Box::new(Client::new(stream)))
     }
 
     async fn get_agent_sock_for_pubkey(
@@ -189,7 +181,7 @@ impl MuxAgent {
 
         log::debug!("Refreshing identities");
         for sock_path in &self.socket_paths {
-            let mut client = match self.connect_upstream_agent(sock_path) {
+            let mut client = match self.connect_upstream_agent(sock_path).await {
                 Ok(c) => c,
                 Err(_) => {
                     log::warn!(
@@ -199,7 +191,25 @@ impl MuxAgent {
                     continue;
                 }
             };
-            let agent_identities = client.request_identities().await?;
+            let agent_identities =
+                match timeout(UPSTREAM_TIMEOUT, client.request_identities()).await {
+                    Ok(Ok(ids)) => ids,
+                    Ok(Err(e)) => {
+                        log::warn!(
+                            "Failed to list identities from upstream agent <{}>: {}",
+                            sock_path.display(),
+                            e
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "Timeout listing identities from upstream agent <{}>",
+                            sock_path.display()
+                        );
+                        continue;
+                    }
+                };
             {
                 for id in &agent_identities {
                     known_keys.insert(id.pubkey.clone(), sock_path.clone());
@@ -237,9 +247,6 @@ struct SelfDeletingUnixListener {
 impl SelfDeletingUnixListener {
     fn bind(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if std::fs::remove_file(&path).is_ok() {
-            log::debug!("Deleted existing socket {}", path.display());
-        }
         UnixListener::bind(&path).map(|listener| Self { path, listener })
     }
 }
