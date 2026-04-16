@@ -16,6 +16,7 @@ use tokio::{
     net::UnixListener,
     net::UnixStream,
     sync::{Mutex, OwnedMutexGuard},
+    task::JoinSet,
     time::timeout,
 };
 
@@ -150,24 +151,30 @@ impl Session for MuxSession {
 }
 
 impl MuxSession {
+    /// Connect to an upstream agent socket.
+    async fn connect(sock_path: &Path) -> Result<Box<dyn Session>, AgentError> {
+        let stream = match timeout(CONNECT_TIMEOUT, UnixStream::connect(sock_path)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(AgentError::IO(e)),
+            Err(_) => {
+                return Err(AgentError::Other(
+                    format!("Timeout connecting to agent at {}", sock_path.display()).into(),
+                ))
+            }
+        };
+        log::trace!(
+            "Connected to upstream agent on socket: {}",
+            sock_path.display()
+        );
+        Ok(Box::new(Client::new(stream)))
+    }
+
     /// Ensure a persistent connection exists for the given upstream socket.
     async fn ensure_connected(&mut self, sock_path: &Path) -> Result<(), AgentError> {
         let path_buf = sock_path.to_path_buf();
         if !self.upstream.contains_key(&path_buf) {
-            let stream = match timeout(CONNECT_TIMEOUT, UnixStream::connect(sock_path)).await {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => return Err(AgentError::IO(e)),
-                Err(_) => {
-                    return Err(AgentError::Other(
-                        format!("Timeout connecting to agent at {}", sock_path.display()).into(),
-                    ))
-                }
-            };
-            log::trace!(
-                "Connected to upstream agent on socket: {}",
-                sock_path.display()
-            );
-            self.upstream.insert(path_buf, Box::new(Client::new(stream)));
+            let client = Self::connect(sock_path).await?;
+            self.upstream.insert(path_buf, client);
         }
         Ok(())
     }
@@ -193,46 +200,64 @@ impl MuxSession {
         known_keys.clear();
 
         log::debug!("Refreshing identities");
-        let paths: Vec<_> = self.socket_paths.clone();
-        for sock_path in paths {
-            if let Err(_) = self.ensure_connected(&sock_path).await {
-                log::warn!(
-                    "Ignoring missing upstream agent socket: {}",
-                    sock_path.display()
-                );
-                continue;
-            }
-            let client = self.upstream.get_mut(&sock_path).unwrap();
-            let agent_identities =
-                match timeout(UPSTREAM_TIMEOUT, client.request_identities()).await {
-                    Ok(Ok(ids)) => ids,
-                    Ok(Err(e)) => {
-                        log::warn!(
-                            "Failed to list identities from upstream agent <{}>: {}",
-                            sock_path.display(),
-                            e
-                        );
-                        self.upstream.remove(&sock_path);
-                        continue;
-                    }
+
+        // Take existing connections out and connect to any missing agents.
+        // Each agent is then queried for identities in parallel.
+        let mut tasks: JoinSet<(PathBuf, Box<dyn Session>, Result<Vec<Identity>, AgentError>)> =
+            JoinSet::new();
+
+        for sock_path in self.socket_paths.clone() {
+            let mut client = match self.upstream.remove(&sock_path) {
+                Some(c) => c,
+                None => match Self::connect(&sock_path).await {
+                    Ok(c) => c,
                     Err(_) => {
                         log::warn!(
-                            "Timeout listing identities from upstream agent <{}>",
+                            "Ignoring missing upstream agent socket: {}",
                             sock_path.display()
                         );
-                        self.upstream.remove(&sock_path);
                         continue;
                     }
+                },
+            };
+            tasks.spawn(async move {
+                let result = match timeout(UPSTREAM_TIMEOUT, client.request_identities()).await {
+                    Ok(r) => r,
+                    Err(_) => Err(AgentError::Other("timeout".into())),
                 };
-            for id in &agent_identities {
-                known_keys.insert(id.pubkey.clone(), sock_path.clone());
+                (sock_path, client, result)
+            });
+        }
+
+        while let Some(join_result) = tasks.join_next().await {
+            let (sock_path, client, result) = match join_result {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("Identity task panicked: {}", e);
+                    continue;
+                }
+            };
+            match result {
+                Ok(ids) => {
+                    log::trace!(
+                        "Got {} identities from {}",
+                        ids.len(),
+                        sock_path.display()
+                    );
+                    for id in &ids {
+                        known_keys.insert(id.pubkey.clone(), sock_path.clone());
+                    }
+                    identities.extend(ids);
+                    self.upstream.insert(sock_path, client);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to list identities from upstream agent <{}>: {}",
+                        sock_path.display(),
+                        e
+                    );
+                }
             }
-            log::trace!(
-                "Got {} identities from {}",
-                agent_identities.len(),
-                sock_path.display()
-            );
-            identities.extend(agent_identities);
         }
 
         Ok(identities)
