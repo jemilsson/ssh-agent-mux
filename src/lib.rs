@@ -27,10 +27,21 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 type KnownPubKeysMap = HashMap<PubKeyData, PathBuf>;
 type KnownPubKeys = Arc<Mutex<KnownPubKeysMap>>;
 
-/// Only the `request_identities`, `sign`, and `extension` commands are implemented. For
-/// `extension`, only the `session-bind@openssh.com` and `query` extensions are supported.
+/// Per-client session with persistent upstream connections.
+///
+/// Each SSH client connection to the mux gets its own `MuxSession` with
+/// its own set of upstream agent connections. This preserves session-bind
+/// state across operations: when OpenSSH sends session-bind followed by
+/// sign, both go through the same upstream connection, so the host key
+/// binding is retained for the signature.
+pub struct MuxSession {
+    socket_paths: Vec<PathBuf>,
+    known_keys: KnownPubKeys,
+    upstream: HashMap<PathBuf, Box<dyn Session>>,
+}
+
 #[ssh_agent_lib::async_trait]
-impl Session for MuxAgent {
+impl Session for MuxSession {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
         log::trace!("incoming: request_identities");
         let mut known_keys = self.known_keys.clone().lock_owned().await;
@@ -41,30 +52,41 @@ impl Session for MuxAgent {
         let fingerprint = request.pubkey.fingerprint(Default::default());
         log::trace!("incoming: sign({})", &fingerprint);
 
-        if let Some(agent_sock_path) = self.get_agent_sock_for_pubkey(&request.pubkey).await? {
-            log::info!(
-                "Requesting signature with key {} from upstream agent <{}>",
-                &fingerprint,
-                agent_sock_path.display()
-            );
-
-            let mut client = self.connect_upstream_agent(&agent_sock_path).await?;
-            match timeout(SIGN_TIMEOUT, client.sign(request)).await {
-                Ok(result) => result,
-                Err(_) => {
-                    log::error!(
-                        "Timeout waiting for signature from upstream agent <{}>",
-                        agent_sock_path.display()
-                    );
-                    Err(AgentError::Failure)
-                }
+        let agent_sock_path = match self.get_agent_sock_for_pubkey(&request.pubkey).await? {
+            Some(p) => p,
+            None => {
+                log::error!("No upstream agent found for public key {}", &fingerprint);
+                log::trace!("Known keys:\n{:#?}", self.known_keys);
+                return Err(AgentError::Other(
+                    format!("No agent found for public key: {}", &fingerprint).into(),
+                ));
             }
-        } else {
-            log::error!("No upstream agent found for public key {}", &fingerprint);
-            log::trace!("Known keys:\n{:#?}", self.known_keys);
-            Err(AgentError::Other(
-                format!("No agent found for public key: {}", &fingerprint).into(),
-            ))
+        };
+
+        log::info!(
+            "Requesting signature with key {} from upstream agent <{}>",
+            &fingerprint,
+            agent_sock_path.display()
+        );
+
+        self.ensure_connected(&agent_sock_path).await?;
+        let client = self.upstream.get_mut(&agent_sock_path).unwrap();
+        let result = timeout(SIGN_TIMEOUT, client.sign(request)).await;
+
+        match result {
+            Ok(Ok(sig)) => Ok(sig),
+            Ok(Err(e)) => {
+                self.upstream.remove(&agent_sock_path);
+                Err(e)
+            }
+            Err(_) => {
+                log::error!(
+                    "Timeout waiting for signature from upstream agent <{}>",
+                    agent_sock_path.display()
+                );
+                self.upstream.remove(&agent_sock_path);
+                Err(AgentError::Failure)
+            }
         }
     }
 
@@ -72,22 +94,153 @@ impl Session for MuxAgent {
         log::trace!("incoming: extension({})", request.name);
         match request.name.as_str() {
             "query" => Ok(Some(Extension::new_message(QueryResponse {
-                extensions: vec![],
+                extensions: ["session-bind@openssh.com"].map(String::from).to_vec(),
             })?)),
-            // session-bind@openssh.com is per-connection state in upstream agents,
-            // but the mux creates a new connection for each operation. The binding
-            // would be lost before the subsequent sign request. Returning Failure
-            // makes OpenSSH fall back to regular "publickey" auth instead of
-            // "publickey-hostbound-v00@openssh.com", which works correctly.
             "session-bind@openssh.com" => {
-                log::debug!("Declining session-bind (not supported by multiplexer)");
-                Err(AgentError::Failure)
+                log::debug!("Forwarding session-bind to all upstream agents");
+                let mut any_succeeded = false;
+                let paths: Vec<_> = self.socket_paths.clone();
+                for sock_path in paths {
+                    if let Err(_) = self.ensure_connected(&sock_path).await {
+                        continue;
+                    }
+                    let client = self.upstream.get_mut(&sock_path).unwrap();
+                    match timeout(SESSION_BIND_TIMEOUT, client.extension(request.clone())).await {
+                        Ok(Ok(v)) => {
+                            any_succeeded = true;
+                            if v.is_some() {
+                                log::warn!(
+                                    "session-bind succeeded on <{}> but returned unexpected data",
+                                    sock_path.display()
+                                );
+                            }
+                        }
+                        Ok(Err(AgentError::Failure)) => {
+                            log::debug!(
+                                "Upstream <{}> does not support session-bind",
+                                sock_path.display()
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            log::warn!(
+                                "Error forwarding session-bind to <{}>: {}",
+                                sock_path.display(),
+                                e
+                            );
+                            self.upstream.remove(&sock_path);
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "Timeout forwarding session-bind to <{}>",
+                                sock_path.display()
+                            );
+                            self.upstream.remove(&sock_path);
+                        }
+                    }
+                }
+                if any_succeeded {
+                    Ok(None)
+                } else {
+                    Err(AgentError::Failure)
+                }
             }
             _ => Err(AgentError::Failure),
         }
     }
 }
 
+impl MuxSession {
+    /// Ensure a persistent connection exists for the given upstream socket.
+    async fn ensure_connected(&mut self, sock_path: &Path) -> Result<(), AgentError> {
+        let path_buf = sock_path.to_path_buf();
+        if !self.upstream.contains_key(&path_buf) {
+            let stream = match timeout(CONNECT_TIMEOUT, UnixStream::connect(sock_path)).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => return Err(AgentError::IO(e)),
+                Err(_) => {
+                    return Err(AgentError::Other(
+                        format!("Timeout connecting to agent at {}", sock_path.display()).into(),
+                    ))
+                }
+            };
+            log::trace!(
+                "Connected to upstream agent on socket: {}",
+                sock_path.display()
+            );
+            self.upstream.insert(path_buf, Box::new(Client::new(stream)));
+        }
+        Ok(())
+    }
+
+    async fn get_agent_sock_for_pubkey(
+        &mut self,
+        pubkey: &PubKeyData,
+    ) -> Result<Option<PathBuf>, AgentError> {
+        let mut known_keys = self.known_keys.clone().lock_owned().await;
+        if !known_keys.contains_key(pubkey) {
+            log::debug!("Key not found, re-requesting keys from upstream agents");
+            let _ = self.refresh_identities(&mut known_keys).await?;
+        }
+        let maybe_agent = known_keys.get(pubkey).cloned();
+        Ok(maybe_agent)
+    }
+
+    async fn refresh_identities(
+        &mut self,
+        known_keys: &mut OwnedMutexGuard<KnownPubKeysMap>,
+    ) -> Result<Vec<Identity>, AgentError> {
+        let mut identities = vec![];
+        known_keys.clear();
+
+        log::debug!("Refreshing identities");
+        let paths: Vec<_> = self.socket_paths.clone();
+        for sock_path in paths {
+            if let Err(_) = self.ensure_connected(&sock_path).await {
+                log::warn!(
+                    "Ignoring missing upstream agent socket: {}",
+                    sock_path.display()
+                );
+                continue;
+            }
+            let client = self.upstream.get_mut(&sock_path).unwrap();
+            let agent_identities =
+                match timeout(UPSTREAM_TIMEOUT, client.request_identities()).await {
+                    Ok(Ok(ids)) => ids,
+                    Ok(Err(e)) => {
+                        log::warn!(
+                            "Failed to list identities from upstream agent <{}>: {}",
+                            sock_path.display(),
+                            e
+                        );
+                        self.upstream.remove(&sock_path);
+                        continue;
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "Timeout listing identities from upstream agent <{}>",
+                            sock_path.display()
+                        );
+                        self.upstream.remove(&sock_path);
+                        continue;
+                    }
+                };
+            for id in &agent_identities {
+                known_keys.insert(id.pubkey.clone(), sock_path.clone());
+            }
+            log::trace!(
+                "Got {} identities from {}",
+                agent_identities.len(),
+                sock_path.display()
+            );
+            identities.extend(agent_identities);
+        }
+
+        Ok(identities)
+    }
+}
+
+/// Shared agent state. Cloned for each listener accept; creates a fresh
+/// `MuxSession` (with empty connection cache) per client.
 #[derive(Clone)]
 pub struct MuxAgent {
     socket_paths: Vec<PathBuf>,
@@ -133,98 +286,6 @@ impl MuxAgent {
         };
         agent::listen(listen_sock, this).await
     }
-
-    async fn connect_upstream_agent(
-        &self,
-        sock_path: impl AsRef<Path>,
-    ) -> Result<Box<dyn Session>, AgentError> {
-        let sock_path = sock_path.as_ref();
-        let stream = match timeout(CONNECT_TIMEOUT, UnixStream::connect(sock_path)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => return Err(AgentError::IO(e)),
-            Err(_) => {
-                return Err(AgentError::Other(
-                    format!("Timeout connecting to agent at {}", sock_path.display()).into(),
-                ))
-            }
-        };
-        log::trace!(
-            "Connected to upstream agent on socket: {}",
-            sock_path.display()
-        );
-        Ok(Box::new(Client::new(stream)))
-    }
-
-    async fn get_agent_sock_for_pubkey(
-        &mut self,
-        pubkey: &PubKeyData,
-    ) -> Result<Option<PathBuf>, AgentError> {
-        // Refresh available identities if the public key isn't found;
-        // hold lock for duration of signing operation
-        let mut known_keys = self.known_keys.clone().lock_owned().await;
-        if !known_keys.contains_key(pubkey) {
-            log::debug!("Key not found, re-requesting keys from upstream agents");
-            let _ = self.refresh_identities(&mut known_keys).await?;
-        }
-        let maybe_agent = known_keys.get(pubkey).cloned();
-        Ok(maybe_agent)
-    }
-
-    // Factored out so that the known_keys lock can be held across a total request that includes a
-    // refresh of keys from upstream agents
-    async fn refresh_identities(
-        &mut self,
-        known_keys: &mut OwnedMutexGuard<KnownPubKeysMap>,
-    ) -> Result<Vec<Identity>, AgentError> {
-        let mut identities = vec![];
-        known_keys.clear();
-
-        log::debug!("Refreshing identities");
-        for sock_path in &self.socket_paths {
-            let mut client = match self.connect_upstream_agent(sock_path).await {
-                Ok(c) => c,
-                Err(_) => {
-                    log::warn!(
-                        "Ignoring missing upstream agent socket: {}",
-                        sock_path.display()
-                    );
-                    continue;
-                }
-            };
-            let agent_identities =
-                match timeout(UPSTREAM_TIMEOUT, client.request_identities()).await {
-                    Ok(Ok(ids)) => ids,
-                    Ok(Err(e)) => {
-                        log::warn!(
-                            "Failed to list identities from upstream agent <{}>: {}",
-                            sock_path.display(),
-                            e
-                        );
-                        continue;
-                    }
-                    Err(_) => {
-                        log::warn!(
-                            "Timeout listing identities from upstream agent <{}>",
-                            sock_path.display()
-                        );
-                        continue;
-                    }
-                };
-            {
-                for id in &agent_identities {
-                    known_keys.insert(id.pubkey.clone(), sock_path.clone());
-                }
-            }
-            log::trace!(
-                "Got {} identities from {}",
-                agent_identities.len(),
-                sock_path.display()
-            );
-            identities.extend(agent_identities);
-        }
-
-        Ok(identities)
-    }
 }
 
 impl Agent<SelfDeletingUnixListener> for MuxAgent {
@@ -233,7 +294,11 @@ impl Agent<SelfDeletingUnixListener> for MuxAgent {
         &mut self,
         _socket: &<SelfDeletingUnixListener as ListeningSocket>::Stream,
     ) -> impl Session {
-        self.clone()
+        MuxSession {
+            socket_paths: self.socket_paths.clone(),
+            known_keys: self.known_keys.clone(),
+            upstream: HashMap::new(),
+        }
     }
 }
 
