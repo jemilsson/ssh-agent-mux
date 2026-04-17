@@ -25,17 +25,26 @@
               lockFile = ./Cargo.lock;
             };
 
-            # Fix SkEcdsaSha2NistP256 signature encoding in ssh-key 0.6.7.
-            # The Encode impl only handles SkEd25519 SK trailer (flags + counter)
-            # separately from the signature data, but SkEcdsaSha2NistP256 falls
-            # through to the generic path which wraps everything in one string,
-            # corrupting the signature.
+            # Patch ssh-key 0.6.7 to:
+            #   1. Encode SkEcdsaSha2NistP256 signatures with the SK trailer
+            #      (flags + counter) separated from the signature data, like
+            #      SkEd25519. The generic path wraps the whole lot in one
+            #      length-prefixed string, corrupting the signature.
+            #   2. Accept legacy ssh-rsa signatures (Algorithm::Rsa
+            #      { hash: None }) during decode. gpg-agent emits these when
+            #      the sign request has flags=0, e.g. from pam_ssh_agent_auth.
+            #      Upstream deliberately rejects them as a length error,
+            #      breaking sudo -> YubiKey via the mux.
             postConfigure = ''
               chmod -R +w /build/cargo-vendor-dir/ssh-key-0.6.7/
               substituteInPlace /build/cargo-vendor-dir/ssh-key-0.6.7/src/signature.rs \
                 --replace-fail \
                   'if self.algorithm == Algorithm::SkEd25519 {' \
                   'if self.algorithm == Algorithm::SkEd25519 || self.algorithm == Algorithm::SkEcdsaSha2NistP256 {'
+              substituteInPlace /build/cargo-vendor-dir/ssh-key-0.6.7/src/signature.rs \
+                --replace-fail \
+                  'Algorithm::Rsa { hash: Some(_) } => (),' \
+                  'Algorithm::Rsa { .. } => (),'
             '';
 
             nativeCheckInputs = [ pkgs.openssh ];
