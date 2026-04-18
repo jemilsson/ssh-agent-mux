@@ -25,6 +25,23 @@ pub struct PeerInfo {
 }
 
 impl PeerInfo {
+    /// One-line summary for use in a notification body. Surfaces the
+    /// immediate caller's argv (typically `ssh user@host` or similar)
+    /// on its own line, followed by the parent chain rendered as
+    /// program basenames so the user sees what triggered the signing.
+    pub fn notification_body(&self) -> String {
+        let caller = truncate(&self.cmdline, CMDLINE_DISPLAY_MAX * 2);
+        if self.ancestry.is_empty() {
+            return format!("from: {}", caller);
+        }
+        let chain: Vec<&str> = self
+            .ancestry
+            .iter()
+            .map(|(_, cmd)| basename(cmd))
+            .collect();
+        format!("from: {}\nvia:  {}", caller, chain.join(" \u{2190} "))
+    }
+
     pub fn capture(stream: &UnixStream) -> Option<Self> {
         let cred = stream.peer_cred().ok()?;
         let pid = cred.pid()?;
@@ -78,6 +95,13 @@ fn read_ppid(pid: i32) -> Option<i32> {
     None
 }
 
+/// Basename of the first argv token. Strips `/nix/store/<hash>-<name>/...`
+/// down to just `<name>`-like segments so notification chains stay readable.
+fn basename(cmdline: &str) -> &str {
+    let first = cmdline.split_whitespace().next().unwrap_or(cmdline);
+    first.rsplit('/').next().unwrap_or(first)
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -127,5 +151,30 @@ mod tests {
         let ppid = read_ppid(std::process::id() as i32);
         assert!(ppid.is_some());
         assert!(ppid.unwrap() > 0);
+    }
+
+    #[test]
+    fn basename_strips_nix_store_path() {
+        assert_eq!(basename("/nix/store/abc-zsh-5.9/bin/zsh -c foo"), "zsh");
+        assert_eq!(basename("ssh git@github.com"), "ssh");
+        assert_eq!(basename("/usr/bin/git push"), "git");
+        assert_eq!(basename(""), "");
+    }
+
+    #[test]
+    fn notification_body_includes_caller_and_chain() {
+        let p = PeerInfo {
+            pid: 1234,
+            uid: 1000,
+            gid: 1000,
+            cmdline: "ssh git@github.com".to_string(),
+            ancestry: vec![
+                (1230, "/nix/store/x-zsh-5.9/bin/zsh".to_string()),
+                (1200, "/nix/store/y-kitty-0.4/bin/kitty".to_string()),
+            ],
+        };
+        let body = p.notification_body();
+        assert!(body.contains("from: ssh git@github.com"));
+        assert!(body.contains("via:  zsh \u{2190} kitty"));
     }
 }
