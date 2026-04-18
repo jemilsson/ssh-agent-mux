@@ -94,7 +94,7 @@ impl Session for MuxSession {
             None => "from: <unknown>".to_string(),
         };
         let body = format!("id:   {}\n{}\nkey:  {}", id, peer_body, fingerprint);
-        let _notif = notify::send("ssh-agent-mux: sign", &body);
+        let _notif = notify::send("Signature request", &body);
 
         self.ensure_connected(&agent_sock_path).await?;
         let client = self.upstream.get_mut(&agent_sock_path).unwrap();
