@@ -1,11 +1,12 @@
 //! Best-effort desktop notifications via libnotify (`notify-send`).
 //!
 //! Each sign request fires a notification with the connecting peer chain
-//! (e.g. `claude → node → git → ssh git@github.com`) and a 7-hex-char id
-//! derived from `SHA-256(sign_data)`. linux-id computes the same id from
-//! the matching CTAP2 `clientDataHash` and includes it in its pinentry
-//! prompt, so the user can confirm both notifications belong to the same
-//! request.
+//! (e.g. `claude → node → git → ssh git@github.com`) and a 7-char id
+//! derived from `SHA-256(sign_data)`, encoded in standard base64 without
+//! padding to match the OpenSSH `SHA256:<base64>` fingerprint convention.
+//! linux-id computes the same id from the matching CTAP2 `clientDataHash`
+//! and includes it in its pinentry prompt, so the user can confirm both
+//! notifications belong to the same request.
 //!
 //! All sends are fire-and-forget. A missing `notify-send`, no D-Bus
 //! session, or any spawn failure is silently ignored. A sign must never
@@ -14,6 +15,8 @@
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
+use base64::engine::general_purpose::STANDARD_NO_PAD;
+use base64::Engine;
 use sha2::{Digest, Sha256};
 
 const ID_LEN: usize = 7;
@@ -34,16 +37,16 @@ fn locate() -> Option<&'static str> {
         .as_deref()
 }
 
-/// 7-hex-char id from arbitrary bytes (matching git's short-hash convention).
-pub fn short_id(data: &[u8]) -> String {
+/// Full base64 (no padding) of `SHA-256(data)`. 43 chars for SHA-256.
+pub fn hash(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
-    let mut s = String::with_capacity(ID_LEN);
-    for byte in digest.iter() {
-        if s.len() >= ID_LEN {
-            break;
-        }
-        s.push_str(&format!("{:02x}", byte));
-    }
+    STANDARD_NO_PAD.encode(digest)
+}
+
+/// 7-char prefix of `hash(data)`, suitable for in-the-moment visual
+/// correlation with linux-id's pinentry prompt.
+pub fn short_id(data: &[u8]) -> String {
+    let mut s = hash(data);
     s.truncate(ID_LEN);
     s
 }
@@ -74,10 +77,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn short_id_is_seven_hex_chars() {
-        let id = short_id(b"hello");
+    fn hash_is_43_base64_chars_for_sha256() {
+        let h = hash(b"hello");
+        assert_eq!(h.len(), 43);
+        // No padding, standard alphabet (A-Z a-z 0-9 + /).
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/'));
+    }
+
+    #[test]
+    fn short_id_is_prefix_of_hash() {
+        let data = b"correlate me";
+        let id = short_id(data);
+        let h = hash(data);
         assert_eq!(id.len(), ID_LEN);
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(h.starts_with(&id), "short id must be a prefix of full hash");
     }
 
     #[test]

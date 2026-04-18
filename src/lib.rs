@@ -64,8 +64,9 @@ impl Session for MuxSession {
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
         let fingerprint = request.pubkey.fingerprint(Default::default());
-        let id = notify::short_id(&request.data);
-        log::trace!("incoming: sign({}) id={}", &fingerprint, id);
+        let hash = notify::hash(&request.data);
+        let id = &hash[..hash.len().min(7)];
+        log::trace!("incoming: sign({}) id={} hash={}", &fingerprint, id, hash);
 
         let agent_sock_path = match self.get_agent_sock_for_pubkey(&request.pubkey).await? {
             Some(p) => p,
@@ -79,8 +80,9 @@ impl Session for MuxSession {
         };
 
         log::info!(
-            "sign id={} key={} upstream=<{}> peer={}",
+            "sign id={} hash={} key={} upstream=<{}> peer={}",
             id,
+            hash,
             &fingerprint,
             agent_sock_path.display(),
             self.peer_display()
