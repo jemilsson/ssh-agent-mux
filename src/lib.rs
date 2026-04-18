@@ -1,3 +1,5 @@
+pub mod peer;
+
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -39,12 +41,22 @@ pub struct MuxSession {
     socket_paths: Vec<PathBuf>,
     known_keys: KnownPubKeys,
     upstream: HashMap<PathBuf, Box<dyn Session>>,
+    peer: Option<peer::PeerInfo>,
+}
+
+impl MuxSession {
+    fn peer_display(&self) -> String {
+        match &self.peer {
+            Some(p) => p.to_string(),
+            None => "<unknown>".to_string(),
+        }
+    }
 }
 
 #[ssh_agent_lib::async_trait]
 impl Session for MuxSession {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
-        log::trace!("incoming: request_identities");
+        log::info!("request_identities peer={}", self.peer_display());
         let mut known_keys = self.known_keys.clone().lock_owned().await;
         self.refresh_identities(&mut known_keys).await
     }
@@ -65,9 +77,10 @@ impl Session for MuxSession {
         };
 
         log::info!(
-            "Requesting signature with key {} from upstream agent <{}>",
+            "sign key={} upstream=<{}> peer={}",
             &fingerprint,
-            agent_sock_path.display()
+            agent_sock_path.display(),
+            self.peer_display()
         );
 
         self.ensure_connected(&agent_sock_path).await?;
@@ -98,7 +111,7 @@ impl Session for MuxSession {
                 extensions: ["session-bind@openssh.com"].map(String::from).to_vec(),
             })?)),
             "session-bind@openssh.com" => {
-                log::debug!("Forwarding session-bind to all upstream agents");
+                log::info!("session-bind peer={}", self.peer_display());
 
                 // Forward session-bind to all upstream agents in parallel.
                 let mut tasks: JoinSet<(
@@ -342,12 +355,18 @@ impl Agent<SelfDeletingUnixListener> for MuxAgent {
     #[doc = "Create new session object when a new socket is accepted."]
     fn new_session(
         &mut self,
-        _socket: &<SelfDeletingUnixListener as ListeningSocket>::Stream,
+        socket: &<SelfDeletingUnixListener as ListeningSocket>::Stream,
     ) -> impl Session {
+        let peer = peer::PeerInfo::capture(socket);
+        match &peer {
+            Some(p) => log::info!("new session: {}", p),
+            None => log::info!("new session: <peer unknown>"),
+        }
         MuxSession {
             socket_paths: self.socket_paths.clone(),
             known_keys: self.known_keys.clone(),
             upstream: HashMap::new(),
+            peer,
         }
     }
 }
