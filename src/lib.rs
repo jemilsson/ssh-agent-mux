@@ -89,11 +89,12 @@ impl Session for MuxSession {
         );
 
         // Held until function return; Drop closes the notification via D-Bus.
-        let body = match &self.peer {
-            Some(p) => format!("{}\nkey:  {}", p.notification_body(), fingerprint),
-            None => format!("from: <unknown>\nkey:  {}", fingerprint),
+        let peer_body = match &self.peer {
+            Some(p) => p.notification_body(),
+            None => "from: <unknown>".to_string(),
         };
-        let _notif = notify::send(&format!("ssh-agent-mux: sign [id {}]", id), &body);
+        let body = format!("id:   {}\n{}\nkey:  {}", id, peer_body, fingerprint);
+        let _notif = notify::send("ssh-agent-mux: sign", &body);
 
         self.ensure_connected(&agent_sock_path).await?;
         let client = self.upstream.get_mut(&agent_sock_path).unwrap();
