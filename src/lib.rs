@@ -1,3 +1,4 @@
+pub mod notify;
 pub mod peer;
 
 use std::{
@@ -63,7 +64,8 @@ impl Session for MuxSession {
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
         let fingerprint = request.pubkey.fingerprint(Default::default());
-        log::trace!("incoming: sign({})", &fingerprint);
+        let id = notify::short_id(&request.data);
+        log::trace!("incoming: sign({}) id={}", &fingerprint, id);
 
         let agent_sock_path = match self.get_agent_sock_for_pubkey(&request.pubkey).await? {
             Some(p) => p,
@@ -77,10 +79,16 @@ impl Session for MuxSession {
         };
 
         log::info!(
-            "sign key={} upstream=<{}> peer={}",
+            "sign id={} key={} upstream=<{}> peer={}",
+            id,
             &fingerprint,
             agent_sock_path.display(),
             self.peer_display()
+        );
+
+        notify::send(
+            &format!("ssh-agent-mux: sign [id {}]", id),
+            &format!("key {}\npeer {}", fingerprint, self.peer_display()),
         );
 
         self.ensure_connected(&agent_sock_path).await?;

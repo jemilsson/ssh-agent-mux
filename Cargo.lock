@@ -1529,6 +1529,7 @@ dependencies = [
  "log",
  "serde",
  "service-manager",
+ "sha2",
  "shellexpand",
  "ssh-agent-lib",
  "tempfile",
