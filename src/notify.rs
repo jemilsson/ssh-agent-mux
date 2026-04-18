@@ -1,16 +1,23 @@
 //! Best-effort desktop notifications via libnotify (`notify-send`).
 //!
-//! Each sign request fires a notification with the connecting peer chain
-//! (e.g. `claude → node → git → ssh git@github.com`) and a 7-char id
-//! derived from `SHA-256(sign_data)`, encoded in standard base64 without
-//! padding to match the OpenSSH `SHA256:<base64>` fingerprint convention.
-//! linux-id computes the same id from the matching CTAP2 `clientDataHash`
-//! and includes it in its pinentry prompt, so the user can confirm both
-//! notifications belong to the same request.
+//! Each sign request fires a persistent notification with the connecting
+//! peer chain (e.g. `claude → node → git → ssh git@github.com`) and a
+//! 7-char id derived from `SHA-256(sign_data)`, encoded in standard
+//! base64 without padding to match the OpenSSH `SHA256:<base64>`
+//! fingerprint convention. linux-id computes the same id from the
+//! matching CTAP2 `clientDataHash` and includes it in its pinentry
+//! prompt, so the user can confirm both notifications belong to the same
+//! request.
 //!
-//! All sends are fire-and-forget. A missing `notify-send`, no D-Bus
-//! session, or any spawn failure is silently ignored. A sign must never
-//! fail because the desktop is unreachable.
+//! `send` returns a [`Handle`] whose [`Drop`] impl closes the
+//! notification via the `org.freedesktop.Notifications.CloseNotification`
+//! D-Bus method (invoked through `dbus-send`). The notification is fired
+//! with `--urgency=critical --expire-time=0` so it persists until the
+//! sign returns (success, denial, or timeout) and the handle is dropped.
+//!
+//! Everything is best-effort. A missing `notify-send` or `dbus-send`,
+//! no D-Bus session, or any spawn failure is silently ignored. A sign
+//! must never fail because the desktop is unreachable.
 
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -23,17 +30,18 @@ const ID_LEN: usize = 7;
 
 static NOTIFY_BIN: OnceLock<Option<String>> = OnceLock::new();
 
-fn locate() -> Option<&'static str> {
+fn locate(name: &str) -> Option<String> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|p| p.join(name))
+            .find(|p| p.is_file())
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+}
+
+fn notify_bin() -> Option<&'static str> {
     NOTIFY_BIN
-        .get_or_init(|| {
-            // PATH lookup; ignore failures.
-            std::env::var_os("PATH").and_then(|paths| {
-                std::env::split_paths(&paths)
-                    .map(|p| p.join("notify-send"))
-                    .find(|p| p.is_file())
-                    .map(|p| p.to_string_lossy().into_owned())
-            })
-        })
+        .get_or_init(|| locate("notify-send"))
         .as_deref()
 }
 
@@ -51,25 +59,52 @@ pub fn short_id(data: &[u8]) -> String {
     s
 }
 
-/// Fire a notification asynchronously. Never blocks the caller.
-pub fn send(title: &str, body: &str) {
-    let Some(bin) = locate() else {
-        return;
-    };
-    let _ = Command::new(bin)
+/// A live persistent notification. Drops close it via D-Bus.
+pub struct Handle {
+    id: u32,
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        let Some(bin) = locate("dbus-send") else {
+            return;
+        };
+        let _ = Command::new(bin)
+            .args([
+                "--session",
+                "--type=method_call",
+                "--dest=org.freedesktop.Notifications",
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications.CloseNotification",
+                &format!("uint32:{}", self.id),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+}
+
+/// Fire a persistent notification and return a handle that closes it on
+/// drop. Returns `None` if `notify-send` is unavailable or the call fails.
+pub fn send(title: &str, body: &str) -> Option<Handle> {
+    let bin = notify_bin()?;
+    let output = Command::new(bin)
         .args([
             "--app-name=ssh-agent-mux",
             "--category=device",
-            "--urgency=normal",
-            "--expire-time=15000",
+            "--urgency=critical",
+            "--expire-time=0",
+            "--print-id",
             title,
             body,
         ])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
-    // Spawned process is reaped by the kernel after exit; we don't wait.
+        .output()
+        .ok()?;
+    let id: u32 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+    Some(Handle { id })
 }
 
 #[cfg(test)]

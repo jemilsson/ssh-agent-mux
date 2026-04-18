@@ -88,7 +88,8 @@ impl Session for MuxSession {
             self.peer_display()
         );
 
-        notify::send(
+        // Held until function return; Drop closes the notification via D-Bus.
+        let _notif = notify::send(
             &format!("ssh-agent-mux: sign [id {}]", id),
             &format!("key {}\npeer {}", fingerprint, self.peer_display()),
         );
